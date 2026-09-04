@@ -31,7 +31,16 @@ function getInstance() {
 // ─── SQLite (local dev) ───────────────────────────────────────────────────────
 
 function createSQLiteDB() {
-  const Database = require('better-sqlite3');
+  let Database;
+  try {
+    Database = require('better-sqlite3');
+  } catch {
+    // better-sqlite3 not available (e.g. Render free tier without build tools)
+    // Fall back to in-memory store
+    console.warn('[ULNet DB] better-sqlite3 not available — using in-memory store');
+    return createInMemoryDB();
+  }
+
   const dbPath = path.join(__dirname, '..', '..', 'ulnet_local.db');
   const sqlite = new Database(dbPath);
   sqlite.pragma('journal_mode = WAL');
@@ -58,6 +67,83 @@ function createSQLiteDB() {
         }
         return Promise.reject(err);
       }
+    },
+  };
+}
+
+// ─── In-Memory Store (fallback for Render free tier) ─────────────────────────
+
+function createInMemoryDB() {
+  const tables = {
+    users: [], children: [], user_settings: [], activity_log: [],
+    daily_reports: [], screen_time: [], refresh_tokens: [],
+    password_resets: [], subscriptions: [],
+  };
+
+  return {
+    query: async (sql, params = []) => {
+      // Simple in-memory implementation for basic CRUD
+      const s = sql.trim().toLowerCase();
+
+      if (s.startsWith('select 1')) return { rows: [{ '1': 1 }] };
+
+      // Parse table name
+      const tableMatch = sql.match(/(?:from|into|update)\s+(\w+)/i);
+      const tableName = tableMatch ? tableMatch[1].toLowerCase() : null;
+      const table = tables[tableName] || [];
+
+      if (s.startsWith('insert')) {
+        // Extract column names and values from INSERT
+        const colMatch = sql.match(/\(([^)]+)\)\s+values/i);
+        if (colMatch) {
+          const cols = colMatch[1].split(',').map(c => c.trim());
+          const row = {};
+          cols.forEach((col, i) => { row[col] = params[i] ?? null; });
+          table.push(row);
+          if (tables[tableName] !== undefined) tables[tableName] = table;
+        }
+        return { rows: [], rowCount: 1 };
+      }
+
+      if (s.startsWith('select')) {
+        // Very basic WHERE id = ? support
+        const whereMatch = sql.match(/where\s+(\w+)\s*=\s*\?/i);
+        if (whereMatch) {
+          const col = whereMatch[1];
+          const val = params[0];
+          const filtered = table.filter(r => r[col] === val || String(r[col]) === String(val));
+          return { rows: filtered };
+        }
+        // SELECT COUNT(*)
+        if (s.includes('count(*)')) {
+          return { rows: [{ 'count(*)': table.length, count: table.length }] };
+        }
+        return { rows: table };
+      }
+
+      if (s.startsWith('update')) {
+        const whereMatch = sql.match(/where\s+(\w+)\s*=\s*\?/i);
+        if (whereMatch && tableName) {
+          const col = whereMatch[1];
+          const val = params[params.length - 1];
+          tables[tableName] = table.map(r =>
+            String(r[col]) === String(val) ? { ...r } : r
+          );
+        }
+        return { rows: [], rowCount: 1 };
+      }
+
+      if (s.startsWith('delete')) {
+        const whereMatch = sql.match(/where\s+(\w+)\s*=\s*\?/i);
+        if (whereMatch && tableName) {
+          const col = whereMatch[1];
+          const val = params[0];
+          tables[tableName] = table.filter(r => String(r[col]) !== String(val));
+        }
+        return { rows: [], rowCount: 1 };
+      }
+
+      return { rows: [] };
     },
   };
 }
