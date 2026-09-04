@@ -1,293 +1,172 @@
 /**
- * ULNet Database Service
- *
- * LOCAL DEV:  Uses SQLite via better-sqlite3 (zero install needed)
- * PRODUCTION: Uses PostgreSQL via pg
- *
- * Both expose the same `db.query(sql, params)` API so no other
- * file needs to change.
+ * ULNet Database — Pure JS in-memory store for Render free tier.
+ * No native modules needed. Data persists within a session.
+ * For production: set DATABASE_URL to a PostgreSQL connection string.
  */
 
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createRequire } from 'module';
 
-const require = createRequire(import.meta.url);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const USE_SQLITE = !process.env.DATABASE_URL ||
-  process.env.DATABASE_URL.startsWith('sqlite');
+const USE_PG = process.env.DATABASE_URL &&
+  process.env.DATABASE_URL.startsWith('postgres');
 
-// ─── Singleton ────────────────────────────────────────────────────────────────
+// ─── In-Memory Store ─────────────────────────────────────────────────────────
 
-let _instance = null;
+const store = {
+  users: [],
+  children: [],
+  user_settings: [],
+  activity_log: [],
+  daily_reports: [],
+  screen_time: [],
+  refresh_tokens: [],
+  password_resets: [],
+  subscriptions: [],
+};
 
-function getInstance() {
-  if (_instance) return _instance;
-  _instance = USE_SQLITE ? createSQLiteDB() : createPGDB();
-  return _instance;
-}
+function memQuery(sql, params = []) {
+  const s = sql.trim();
+  const sLow = s.toLowerCase();
 
-// ─── SQLite (local dev) ───────────────────────────────────────────────────────
+  // Health check
+  if (sLow === 'select 1') return { rows: [{ '?column?': 1 }] };
 
-function createSQLiteDB() {
-  let Database;
-  try {
-    Database = require('better-sqlite3');
-  } catch {
-    // better-sqlite3 not available (e.g. Render free tier without build tools)
-    // Fall back to in-memory store
-    console.warn('[ULNet DB] better-sqlite3 not available — using in-memory store');
-    return createInMemoryDB();
+  // Detect table
+  const tMatch = s.match(/(?:FROM|INTO|UPDATE|DELETE FROM)\s+(\w+)/i);
+  const tName = tMatch ? tMatch[1].toLowerCase() : null;
+  if (tName && !store[tName]) store[tName] = [];
+  const table = tName ? store[tName] : [];
+
+  // ── INSERT ────────────────────────────────────────────────────────────────
+  if (sLow.startsWith('insert')) {
+    const colMatch = s.match(/\(([^)]+)\)\s+VALUES/i);
+    if (colMatch) {
+      const cols = colMatch[1].split(',').map(c => c.trim().replace(/"/g, ''));
+      const row = {};
+      cols.forEach((col, i) => { row[col] = params[i] ?? null; });
+      table.push(row);
+    }
+    return { rows: [], rowCount: 1 };
   }
 
-  const dbPath = path.join(__dirname, '..', '..', 'ulnet_local.db');
-  const sqlite = new Database(dbPath);
-  sqlite.pragma('journal_mode = WAL');
-  sqlite.pragma('foreign_keys = ON');
-
-  bootstrapSQLite(sqlite);
-  console.log(`[ULNet DB] ✅ SQLite ready → ${dbPath}`);
-
-  return {
-    query: (sql, params = []) => {
-      const normalised = normaliseSql(sql);
-      try {
-        if (/^\s*(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)/i.test(normalised)) {
-          const stmt = sqlite.prepare(normalised);
-          const info = stmt.run(...params);
-          return Promise.resolve({ rows: [], rowCount: info.changes });
+  // ── UPDATE ────────────────────────────────────────────────────────────────
+  if (sLow.startsWith('update')) {
+    // UPDATE table SET col = ? WHERE id_col = ?
+    const setMatch = s.match(/SET\s+(.+?)\s+WHERE/i);
+    const whereMatch = s.match(/WHERE\s+(\w+)\s*=\s*\?/i);
+    if (setMatch && whereMatch && tName) {
+      const whereCol = whereMatch[1];
+      const whereVal = params[params.length - 1];
+      const setPairs = setMatch[1].split(',').map(p => p.trim());
+      let pi = 0;
+      store[tName] = table.map(row => {
+        if (String(row[whereCol]) === String(whereVal)) {
+          const updated = { ...row };
+          setPairs.forEach(pair => {
+            const [col] = pair.split('=').map(x => x.trim());
+            updated[col] = params[pi++];
+          });
+          return updated;
         }
-        const stmt = sqlite.prepare(normalised);
-        const rows = stmt.all(...params);
-        return Promise.resolve({ rows });
-      } catch (err) {
-        if (err.message?.includes('already exists')) {
-          return Promise.resolve({ rows: [] });
-        }
-        return Promise.reject(err);
+        return row;
+      });
+    }
+    return { rows: [], rowCount: 1 };
+  }
+
+  // ── DELETE ────────────────────────────────────────────────────────────────
+  if (sLow.startsWith('delete')) {
+    const whereMatch = s.match(/WHERE\s+(\w+)\s*=\s*\?/i);
+    if (whereMatch && tName) {
+      const col = whereMatch[1];
+      const val = params[0];
+      store[tName] = table.filter(r => String(r[col]) !== String(val));
+    }
+    return { rows: [], rowCount: 1 };
+  }
+
+  // ── SELECT ────────────────────────────────────────────────────────────────
+  if (sLow.startsWith('select')) {
+    // COUNT(*)
+    if (sLow.includes('count(*)')) {
+      const cnt = table.length;
+      return { rows: [{ count: cnt, 'count(*)': cnt, 'COUNT(*)': cnt }] };
+    }
+
+    let results = [...table];
+
+    // Simple WHERE col = ?
+    const whereMatches = [...s.matchAll(/(\w+)\s*=\s*\?/gi)];
+    whereMatches.forEach((m, i) => {
+      const col = m[1];
+      const val = params[i];
+      if (col && val !== undefined) {
+        results = results.filter(r =>
+          String(r[col]) === String(val)
+        );
       }
-    },
-  };
+    });
+
+    // JOIN: if query has JOIN, try to enrich results
+    if (sLow.includes('join')) {
+      const joinMatch = s.match(/JOIN\s+(\w+)\s+\w+\s+ON\s+\w+\.(\w+)\s*=\s*\w+\.(\w+)/gi);
+      // For now return results as-is — complex joins handled by route logic
+    }
+
+    // LIMIT
+    const limitMatch = s.match(/LIMIT\s+(\d+)/i);
+    if (limitMatch) results = results.slice(0, parseInt(limitMatch[1], 10));
+
+    // OFFSET
+    const offsetMatch = s.match(/OFFSET\s+(\d+)/i);
+    if (offsetMatch) results = results.slice(parseInt(offsetMatch[1], 10));
+
+    return { rows: results };
+  }
+
+  return { rows: [] };
 }
 
-// ─── In-Memory Store (fallback for Render free tier) ─────────────────────────
+// ─── PostgreSQL ───────────────────────────────────────────────────────────────
 
-function createInMemoryDB() {
-  const tables = {
-    users: [], children: [], user_settings: [], activity_log: [],
-    daily_reports: [], screen_time: [], refresh_tokens: [],
-    password_resets: [], subscriptions: [],
-  };
-
-  return {
-    query: async (sql, params = []) => {
-      // Simple in-memory implementation for basic CRUD
-      const s = sql.trim().toLowerCase();
-
-      if (s.startsWith('select 1')) return { rows: [{ '1': 1 }] };
-
-      // Parse table name
-      const tableMatch = sql.match(/(?:from|into|update)\s+(\w+)/i);
-      const tableName = tableMatch ? tableMatch[1].toLowerCase() : null;
-      const table = tables[tableName] || [];
-
-      if (s.startsWith('insert')) {
-        // Extract column names and values from INSERT
-        const colMatch = sql.match(/\(([^)]+)\)\s+values/i);
-        if (colMatch) {
-          const cols = colMatch[1].split(',').map(c => c.trim());
-          const row = {};
-          cols.forEach((col, i) => { row[col] = params[i] ?? null; });
-          table.push(row);
-          if (tables[tableName] !== undefined) tables[tableName] = table;
-        }
-        return { rows: [], rowCount: 1 };
-      }
-
-      if (s.startsWith('select')) {
-        // Very basic WHERE id = ? support
-        const whereMatch = sql.match(/where\s+(\w+)\s*=\s*\?/i);
-        if (whereMatch) {
-          const col = whereMatch[1];
-          const val = params[0];
-          const filtered = table.filter(r => r[col] === val || String(r[col]) === String(val));
-          return { rows: filtered };
-        }
-        // SELECT COUNT(*)
-        if (s.includes('count(*)')) {
-          return { rows: [{ 'count(*)': table.length, count: table.length }] };
-        }
-        return { rows: table };
-      }
-
-      if (s.startsWith('update')) {
-        const whereMatch = sql.match(/where\s+(\w+)\s*=\s*\?/i);
-        if (whereMatch && tableName) {
-          const col = whereMatch[1];
-          const val = params[params.length - 1];
-          tables[tableName] = table.map(r =>
-            String(r[col]) === String(val) ? { ...r } : r
-          );
-        }
-        return { rows: [], rowCount: 1 };
-      }
-
-      if (s.startsWith('delete')) {
-        const whereMatch = sql.match(/where\s+(\w+)\s*=\s*\?/i);
-        if (whereMatch && tableName) {
-          const col = whereMatch[1];
-          const val = params[0];
-          tables[tableName] = table.filter(r => String(r[col]) !== String(val));
-        }
-        return { rows: [], rowCount: 1 };
-      }
-
-      return { rows: [] };
-    },
-  };
-}
-
-// ─── PostgreSQL (production) ──────────────────────────────────────────────────
-
-function createPGDB() {
+async function createPGDB() {
+  const { createRequire } = await import('module');
+  const require = createRequire(import.meta.url);
   const { Pool } = require('pg');
   const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.NODE_ENV === 'production'
-      ? { rejectUnauthorized: false } : false,
-    max: 20,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 2000,
+    ssl: { rejectUnauthorized: false },
+    max: 10,
   });
-  pool.on('error', (err) =>
-    console.error('[ULNet DB] PostgreSQL pool error:', err.message));
+  pool.on('error', err => console.error('[DB] Pool error:', err.message));
   return pool;
 }
 
-// ─── Exports ──────────────────────────────────────────────────────────────────
+// ─── Singleton ────────────────────────────────────────────────────────────────
+
+let _db = null;
+
+async function getDB() {
+  if (_db) return _db;
+  if (USE_PG) {
+    _db = await createPGDB();
+    console.log('[ULNet DB] ✅ PostgreSQL connected');
+  } else {
+    _db = { query: (sql, params) => Promise.resolve(memQuery(sql, params)) };
+    console.log('[ULNet DB] ✅ In-memory store ready');
+  }
+  return _db;
+}
 
 export const db = {
-  query: (sql, params) => getInstance().query(sql, params),
+  query: async (sql, params) => {
+    const instance = await getDB();
+    return instance.query(sql, params);
+  },
 };
 
 export async function connectDB() {
-  const inst = getInstance();
-  if (!USE_SQLITE) {
-    try {
-      await inst.query('SELECT 1');
-      console.log('[ULNet DB] ✅ PostgreSQL connected');
-    } catch (err) {
-      console.error('[ULNet DB] ❌ PostgreSQL failed:', err.message);
-      process.exit(1);
-    }
-  }
-}
-
-// ─── SQL normaliser: PostgreSQL → SQLite ──────────────────────────────────────
-
-function normaliseSql(sql) {
-  return sql
-    .replace(/\$(\d+)/g, '?')                           // $1 → ?
-    .replace(/::date|::text|::int|::boolean/gi, '')      // type casts
-    .replace(/NOW\(\)/gi, "datetime('now')")
-    .replace(/CURRENT_DATE/gi, "date('now')")
-    .replace(/INTERVAL\s+'(\d+)\s+days'/gi, (_, n) => `'+${n} days'`)
-    .replace(/gen_random_uuid\(\)/gi, "(lower(hex(randomblob(16))))")
-    .replace(/ON CONFLICT\s*\(([^)]+)\)\s*DO UPDATE SET/gi,
-             'ON CONFLICT($1) DO UPDATE SET')
-    .replace(/RETURNING \*/gi, '')
-    .replace(/JSONB/gi, 'TEXT')
-    .replace(/TIMESTAMPTZ/gi, 'TEXT')
-    .replace(/SMALLINT/gi, 'INTEGER')
-    .replace(/VARCHAR\(\d+\)/gi, 'TEXT')
-    .replace(/\bBOOLEAN\b/gi, 'INTEGER')
-    .replace(/\bTRUE\b/gi, '1')
-    .replace(/\bFALSE\b/gi, '0')
-    // SQLite doesn't support FILTER (WHERE ...) in aggregates — strip it
-    .replace(/COUNT\(\*\)\s*FILTER\s*\(WHERE[^)]+\)/gi, 'COUNT(*)')
-    // Strip window functions / complex casts that SQLite chokes on
-    .replace(/date_trunc\('[^']+',\s*[^)]+\)/gi, "date('now')")
-    .replace(/::\w+/g, '');
-}
-
-// ─── Schema bootstrap (SQLite only) ──────────────────────────────────────────
-
-function bootstrapSQLite(sqlite) {
-  sqlite.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'parent',
-      fcm_token TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS children (
-      id TEXT PRIMARY KEY,
-      parent_id TEXT NOT NULL,
-      child_user_id TEXT NOT NULL,
-      name TEXT NOT NULL,
-      age INTEGER NOT NULL,
-      avatar TEXT DEFAULT '👦',
-      is_active INTEGER NOT NULL DEFAULT 1,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS user_settings (
-      user_id TEXT PRIMARY KEY,
-      settings TEXT NOT NULL DEFAULT '{}',
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS activity_log (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      type TEXT NOT NULL,
-      reason TEXT,
-      url TEXT,
-      platform TEXT,
-      content TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS daily_reports (
-      id TEXT PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      report_date TEXT NOT NULL,
-      blocked_total INTEGER NOT NULL DEFAULT 0,
-      scams_blocked INTEGER NOT NULL DEFAULT 0,
-      explicit_blocked INTEGER NOT NULL DEFAULT 0,
-      screen_time_data TEXT DEFAULT '{}',
-      raw_summary TEXT DEFAULT '{}',
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE (user_id, report_date)
-    );
-    CREATE TABLE IF NOT EXISTS screen_time (
-      id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-      child_id TEXT NOT NULL,
-      platform TEXT NOT NULL,
-      minutes INTEGER NOT NULL DEFAULT 0,
-      recorded_date TEXT NOT NULL DEFAULT (date('now')),
-      UNIQUE (child_id, platform, recorded_date)
-    );
-    CREATE TABLE IF NOT EXISTS refresh_tokens (
-      user_id TEXT PRIMARY KEY,
-      token TEXT NOT NULL,
-      expires_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS password_resets (
-      user_id TEXT PRIMARY KEY,
-      token TEXT NOT NULL,
-      expires_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS subscriptions (
-      id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
-      user_id TEXT NOT NULL,
-      plan TEXT NOT NULL DEFAULT 'free',
-      status TEXT NOT NULL DEFAULT 'active',
-      started_at TEXT NOT NULL DEFAULT (datetime('now')),
-      expires_at TEXT
-    );
-  `);
+  await getDB();
 }
