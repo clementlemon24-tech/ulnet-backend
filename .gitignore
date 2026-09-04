@@ -1,0 +1,4 @@
+node_modules/
+.env
+ulnet_local.db
+*.log

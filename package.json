@@ -1,0 +1,34 @@
+{
+  "name": "@ulnet/backend",
+  "version": "1.0.0",
+  "description": "ULNet backend API — Express + PostgreSQL",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "db:setup": "node -e \"import('./src/services/database.js').then(m => m.db.query(require('fs').readFileSync('./src/utils/schema.sql','utf8')))\""
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^13.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^16.6.1",
+    "express": "^4.22.2",
+    "express-rate-limit": "^7.5.1",
+    "firebase-admin": "^12.2.0",
+    "helmet": "^7.2.0",
+    "jsonwebtoken": "^9.0.3",
+    "morgan": "^1.12.0",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.10.1",
+    "pg": "^8.23.0",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
