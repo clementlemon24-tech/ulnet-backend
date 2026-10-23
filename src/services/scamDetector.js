@@ -1,12 +1,29 @@
 /**
  * ULNet Scam URL Detector
- * Checks URLs against:
- * 1. Local Nigerian scam domain blocklist
- * 2. URL pattern analysis
- * 3. Google Safe Browsing API (optional)
  */
 
-import { NIGERIAN_SCAM_DOMAINS, SUSPICIOUS_URL_PATTERNS } from '../../../shared/scamlists/domains.js';
+// Inlined scam domains — no external file dependency
+const NIGERIAN_SCAM_DOMAINS = [
+  'nigeriaponzi.net','mmmnigeria.org','loomdonate.com','loomcircle.net',
+  'doubleinvestment.com','doubleyournaira.com','getrichfast.ng',
+  'nairawin.site','win50knaira.com','freecashtransfer.com',
+  'fakegtbank.com','gtbank-verify.com','zenithbank-verify.com',
+  'access-bank-update.com','firstbank-verify.com','uba-bank-alert.com',
+  'cbn-verify.com','cbn-grant.com','efcc-clearance.com',
+  'bvn-update.com','nin-verify.site','ng-verify.site',
+  'nnpc-dividend.com','nddc-palliative.com','palliative-claim.ng',
+];
+
+const SUSPICIOUS_URL_PATTERNS = [
+  { regex: /win.*naira/i, description: 'Fake naira giveaway' },
+  { regex: /free.*money.*nigeria/i, description: 'Free money scam' },
+  { regex: /bitcoin.*double/i, description: 'Bitcoin doubling scam' },
+  { regex: /confirm.*bvn/i, description: 'BVN phishing' },
+  { regex: /cbn.*grant.*apply/i, description: 'Fake CBN grant' },
+  { regex: /efcc.*release.*fund/i, description: 'Fake EFCC fund' },
+  { regex: /double.*your.*(money|investment)/i, description: 'Investment doubling scam' },
+  { regex: /guaranteed.*profit/i, description: 'Guaranteed profit scam' },
+];
 
 const SAFE_BROWSING_URL = 'https://safebrowsing.googleapis.com/v4/threatMatches:find';
 
