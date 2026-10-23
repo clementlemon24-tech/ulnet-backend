@@ -1,9 +1,20 @@
 /**
  * ULNet Notification Service
- * Handles: Firebase push notifications, email reports, WhatsApp summaries (via Twilio)
+ * Handles: Firebase push notifications, email reports
  */
 
-import admin from 'firebase-admin';
+// firebase-admin loaded lazily so server starts without it
+let admin = null;
+async function getAdmin() {
+  if (admin) return admin;
+  try {
+    const mod = await import('firebase-admin');
+    admin = mod.default || mod;
+  } catch {
+    admin = null;
+  }
+  return admin;
+}
 
 // ─── Firebase Admin Init ──────────────────────────────────────────────────────
 
